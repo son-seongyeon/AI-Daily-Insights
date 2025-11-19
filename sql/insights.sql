@@ -1,0 +1,7 @@
+CREATE TABLE insights (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    summary VARCHAR(500) NULL,
+    keywords VARCHAR(500) NULL,
+    insight TEXT NOT NULL
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

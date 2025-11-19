@@ -1,0 +1,318 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Stack to Create EC2 Layer for 'AI Daily Insights'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project Name
+    Default: my
+
+Mappings:
+  AmiMap:
+    instance:
+      Ami: ami-06a15f1e8514b802f
+    openvpn:
+      Ami: ami-09a093fa2e3bfca5a
+
+Resources:
+
+  # ============================================================
+  # Web Tier: ALB + SG
+  # ============================================================
+  WebAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: "Web ALB Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0     # Allow public HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0     # Allow public HTTPS
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-alb-sg"
+
+  WebAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing          # Public ALB
+      Name: !Sub "${ProjectName}-web-alb"
+      SecurityGroups:
+        - !Ref WebAlbSg
+      Subnets:
+        - !ImportValue PubSn1Id
+        - !ImportValue PubSn2Id
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-alb"
+
+  WebAlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-web-tg"
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: '/index.php'
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      VpcId: !ImportValue VpcId
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: 3600  # 1-hour session stickiness
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-tg"
+
+  WebAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAlbTg
+      LoadBalancerArn: !Ref WebAlb
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================
+  # App Tier: Internal ALB + SG
+  # ============================================================
+  AppAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: "App ALB Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebSg     # Allow traffic only from Web servers
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-app-alb-sg"
+
+  AppAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal                     # Internal-only ALB
+      Name: !Sub "${ProjectName}-app-alb"
+      SecurityGroups:
+        - !Ref AppAlbSg
+      Subnets:
+        - !ImportValue AppSn5Id
+        - !ImportValue AppSn6Id
+
+  AppAlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-app-tg"
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: '/health'
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      VpcId: !ImportValue VpcId
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: 3600
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-app-tg"
+
+  AppAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppAlbTg
+      LoadBalancerArn: !Ref AppAlb
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================
+  # Web EC2: SG + Launch Template
+  # ============================================================
+  WebSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: "Web Instance Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.16.0.0/16         # Internal SSH only
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebAlbSg  # Allow ALB → EC2 HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WebAlbSg  # Allow ALB → EC2 HTTPS
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 172.16.2.100/24       # Internal ICMP
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-web-sg"
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-web-lt"
+      VersionDescription: version 1.0
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmiMap, instance, Ami]
+        InstanceType: t3.micro
+        KeyName: !Sub "${ProjectName}-key"
+        SecurityGroupIds:
+          - !Ref WebSg
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                # Install Apache + PHP for web UI
+                yum update -y
+                yum install -y httpd php php-cli php-common php-curl php-mysqlnd
+
+                systemctl enable httpd
+                systemctl start httpd
+
+                # Pass App ALB endpoint into environment
+                echo "APP_API_URL=http://${AppAlbDNS}/health" >> /etc/environment
+                echo "SetEnv APP_API_URL http://${AppAlbDNS}/health" >> /etc/httpd/conf/httpd.conf
+              - AppAlbDNS: !GetAtt AppAlb.DNSName
+
+  # ============================================================
+  # App EC2: SG + Launch Template
+  # ============================================================
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VpcId
+      GroupDescription: "App Instance Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.16.0.0/16         # Internal SSH only
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AppAlbSg     # ALB → App EC2 HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AppAlbSg
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 172.16.2.100/24        # Internal ICMP
+      Tags:
+        - Key : Name
+          Value : !Sub "${ProjectName}-app-sg"
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-app-lt"
+      VersionDescription: version 1.0
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmiMap, instance, Ami]
+        InstanceType: t3.micro
+        KeyName: !Sub "${ProjectName}-key"
+        SecurityGroupIds:
+          - !Ref AppSg
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "app-ec2"
+              - Key: Role
+                Value: !Sub "nlp-analyzer"   # App instances run NLP analyzer
+
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            # Install Python for NLP pipeline
+            amazon-linux-extras enable python3.8
+            yum install python38 python38-pip -y
+            pip3.8 install boto3 openai pymysql pandas
+
+            # Install FastAPI + Uvicorn for backend API
+            yum install -y python3 python3-pip mariadb
+            pip3 install fastapi uvicorn
+
+  # ============================================================
+  # Auto Scaling Groups (Web & App)
+  # ============================================================
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-web-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !ImportValue WebSn3Id
+        - !ImportValue WebSn4Id
+      TargetGroupARNs:
+        - !Ref WebAlbTg
+      DesiredCapacity: 2
+      MinSize: 2
+      MaxSize: 4     # Auto-scale up to 4 web servers
+
+  WebScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50   # Scale around 50% CPU
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-app-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !ImportValue AppSn5Id
+        - !ImportValue AppSn6Id
+      TargetGroupARNs:
+        - !Ref AppAlbTg
+      DesiredCapacity: 2
+      MinSize: 2
+      MaxSize: 4     # Scale NLP servers based on load
+
+  AppScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+...
