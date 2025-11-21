@@ -207,4 +207,8 @@ if __name__ == "__main__":
     main()
 EOF
 
+<<<<<<< HEAD
 echo "Setup completed: FastAPI and NLP Analyzer installed successfully."
+=======
+echo "Setup completed: FastAPI and NLP Analyzer installed successfully."
+>>>>>>> a53ca828d2c4173decb388d46c4587025055fced
