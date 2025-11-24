@@ -1,0 +1,5 @@
+CREATE TABLE articles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(500) NOT NULL,
+    link TEXT NOT NULL
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
